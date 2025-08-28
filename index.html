@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>JARVIS — Listen, Wake-word & Vision</title>
+
+  <!-- TFJS + COCO-SSD (object detection) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+  <style>
+    html,body { height:100%; margin:0; }
+    body {
+      background: url('jarvis.gif') center center / cover no-repeat, linear-gradient(180deg,#000000,#00131a);
+      font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;
+      overflow:hidden;
+    }
+    .overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none; }
+    .mic-wrap { position:fixed; bottom:8vmin; left:50%; transform:translateX(-50%); pointer-events:auto; display:flex; flex-direction:column; align-items:center; gap:12px; }
+    .mic { width:15vmin; height:15vmin; border-radius:50%; background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.06), rgba(255,255,255,0.02)); border:3px solid rgba(255,255,255,0.18); display:flex; align-items:center; justify-content:center; box-shadow: 0 10px 40px rgba(0,0,0,0.6), inset 0 -8px 20px rgba(0,0,0,0.25); cursor:pointer; transition: transform .18s ease, box-shadow .18s ease; user-select:none; }
+    .mic:active { transform: translateY(2px) scale(.98); }
+    .mic-icon { font-size:6vmin; color:#eaf6ff; }
+    .listening { animation: pulse 1.2s infinite ease-in-out; box-shadow: 0 10px 60px rgba(77,163,255,0.18); border-color: rgba(77,163,255,0.8); }
+    @keyframes pulse { 0%{transform:scale(1)}50%{transform:scale(1.05)}100%{transform:scale(1)} }
+    .status { color: rgba(230,245,255,0.88); font-size:1.05rem; text-shadow:0 2px 8px rgba(0,0,0,0.7); pointer-events:none; text-align:center; max-width:80vw; }
+    .fallback-bar { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: rgba(3,12,16,0.72); border: 1px solid rgba(255,255,255,0.06); color: #e7f6ff; padding:8px 12px; border-radius:10px; display:none; z-index:9999; pointer-events:auto; }
+    .wake-indicator { font-size:0.85rem; color:#9fe0ff; opacity:0.9; }
+    /* hidden video/canvas for camera capture */
+    #cameraVideo, #snapshotCanvas { display:none; }
+  </style>
+</head>
+<body>
+  <div class="overlay" aria-hidden="true"></div>
+
+  <div class="fallback-bar" id="fallbackBar"></div>
+
+  <div class="mic-wrap" aria-hidden="false">
+    <div id="statusText" class="status" aria-live="polite">Click the mic to speak, or double-click to enable wake-word mode.</div>
+    <div id="micBtn" class="mic" role="button" aria-label="Talk to JARVIS" title="Talk to JARVIS (click or double-click to toggle wake mode)">
+      <div class="mic-icon">🎙️</div>
+    </div>
+    <div id="wakeBadge" class="wake-indicator" style="display:none;">Wake-word mode: ON (listening for "Jarvis")</div>
+  </div>
+
+  <!-- Hidden camera elements -->
+  <video id="cameraVideo" autoplay playsinline></video>
+  <canvas id="snapshotCanvas"></canvas>
+
+<script>
+/* JARVIS — listen/wake + on-device vision (COCO-SSD)
+   - Model loads on page load in background
+   - When user asks a vision-related command, camera starts, model detects, results spoken
+*/
+
+const micBtn = document.getElementById('micBtn');
+const statusText = document.getElementById('statusText');
+const fallbackBar = document.getElementById('fallbackBar');
+const wakeBadge = document.getElementById('wakeBadge');
+const cameraVideo = document.getElementById('cameraVideo');
+const snapshotCanvas = document.getElementById('snapshotCanvas');
+
+let messages = [];
+let savedWindow = null;
+let model = null;
+let modelLoaded = false;
+let cameraStream = null;
+
+let recognition = null, wakeRecog = null, commandRecog = null;
+let listening = false, wakeMode = false, processingCommand = false, lastWakeMs = 0;
+
+/* Utility functions */
+function shortUrl(u) { try { const url = new URL(u); return url.hostname + (url.pathname !== '/' ? url.pathname : ''); } catch { return u; } }
+function escapeHtml(s) { return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+function speak(text) { if (!text || !('speechSynthesis' in window)) return; speakUtterance(text); }
+function speakUtterance(txt, onend) {
+  const sentences = txt.match(/[^\.!\?]+[\.!\?]*/g) || [txt];
+  let i = 0;
+  function speakNext() {
+    if (i >= sentences.length) { if (onend) onend(); return; }
+    const utt = new SpeechSynthesisUtterance(sentences[i].trim());
+    const voices = speechSynthesis.getVoices();
+    const v = voices.find(v=>/en-GB/.test(v.lang)) || voices.find(v=>/en-/.test(v.lang)) || voices[0];
+    if (v) utt.voice = v;
+    utt.rate = 1.0;
+    utt.onend = () => { i++; speakNext(); };
+    speechSynthesis.cancel();
+    speechSynthesis.speak(utt);
+  }
+  speakNext();
+}
+
+/* ------------------ Vision: load model ------------------ */
+async function loadVisionModel() {
+  try {
+    statusText.textContent = 'Loading vision model…';
+    model = await cocoSsd.load();
+    modelLoaded = true;
+    statusText.textContent = 'Vision model ready.';
+    console.log('COCO-SSD loaded');
+  } catch (e) {
+    console.error('Failed to load vision model', e);
+    statusText.textContent = 'Vision model failed to load.';
+  }
+}
+// Start loading model in background
+loadVisionModel();
+
+/* ------------------ Camera helpers ------------------ */
+async function startCamera() {
+  if (cameraStream) return; // already running
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    cameraVideo.srcObject = cameraStream;
+    // allow a small warm-up
+    await new Promise(resolve => setTimeout(resolve, 700));
+    return true;
+  } catch (e) {
+    console.warn('Camera start failed', e);
+    cameraStream = null;
+    speak('I cannot access the camera, sir.');
+    return false;
+  }
+}
+
+function stopCamera() {
+  if (!cameraStream) return;
+  try {
+    cameraStream.getTracks().forEach(t => t.stop());
+  } catch (e) {}
+  cameraStream = null;
+  cameraVideo.srcObject = null;
+}
+
+/* Performs detection on the current video frame (uses model.detect on video element) */
+async function recognizeObjects() {
+  if (!modelLoaded || !model) {
+    speak('My vision system is not ready, sir.');
+    return null;
+  }
+  if (!cameraStream) {
+    const ok = await startCamera();
+    if (!ok) return null;
+  }
+  try {
+    // Use the video element directly
+    const predictions = await model.detect(cameraVideo);
+    return predictions; // array of {class, score, bbox}
+  } catch (e) {
+    console.error('Detection failed', e);
+    speak('Vision processing failed, sir.');
+    return null;
+  } finally {
+    // stopCamera() will be handled by caller (we often want to stop after result)
+  }
+}
+
+/* Compose a friendly description from predictions */
+function describePredictions(preds) {
+  if (!preds || preds.length === 0) return "I don't see anything notable, sir.";
+  // Filter low confidence
+  const good = preds.filter(p => p.score && p.score >= 0.45);
+  if (good.length === 0) return "I don't see anything I can confidently identify, sir.";
+
+  // Count classes
+  const counts = {};
+  good.forEach(p => {
+    const name = p.class;
+    counts[name] = (counts[name] || 0) + 1;
+  });
+  // Build phrases: "two chairs and a laptop"
+  const parts = [];
+  for (const [name, cnt] of Object.entries(counts)) {
+    parts.push(cnt > 1 ? `${cnt} ${name}s` : `a ${name}`);
+  }
+  const out = parts.length > 2 ? parts.slice(0,2).join(', ') + ', and ' + parts.slice(2).join(', ') : parts.join(' and ');
+  return `I see ${out}, sir.`;
+}
+
+/* ------------------ Vision-friendly command detection ------------------ */
+function isVisionRequest(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  // phrases that indicate vision intent
+  const patterns = [
+    /\bwhat(?:'s| is)? (in front of|in front|there|this|that)\b/,
+    /\bwhat do you see\b/,
+    /\bwhat(?:'s| is)? (this|that)\b/,
+    /\bidentify (this|that|object)\b/,
+    /\bwhat am I looking at\b/,
+    /\bwhat(?:'s| is)? (on the table|on the floor|on the desk)\b/,
+    /\b(look|see) (at|around)\b/
+  ];
+  return patterns.some(rx => rx.test(t));
+}
+
+/* ------------------ Existing speech/recognition & wake-word code (adapted) ------------------ */
+
+// Initialize speech recognition components and wake-word (same logic as before)
+if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+  const Recog = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  // Manual one-shot
+  recognition = new Recog();
+  recognition.lang = 'en-US';
+  recognition.interimResults = false;
+  recognition.continuous = false;
+  recognition.onstart = () => { listening = true; micBtn.classList.add('listening'); statusText.textContent = 'Listening (manual), sir…'; };
+  recognition.onend = () => { listening = false; micBtn.classList.remove('listening'); statusText.textContent = wakeMode ? 'Wake-mode active — listening for "Jarvis".' : 'Click the mic to speak, or double-click to enable wake-word mode.'; };
+  recognition.onerror = (e) => { listening = false; micBtn.classList.remove('listening'); statusText.textContent = 'Microphone error. Check permissions, sir.'; console.warn('recognition error', e); };
+  recognition.onresult = async (evt) => { let transcript=''; for (let i=0;i<evt.results.length;i++) transcript+=evt.results[i][0].transcript; await processCommandText(transcript); };
+
+  // Continuous wake recognizer
+  wakeRecog = new Recog();
+  wakeRecog.lang = 'en-US';
+  wakeRecog.interimResults = true;
+  wakeRecog.continuous = true;
+
+  wakeRecog.onstart = () => { statusText.textContent = 'Wake-mode: listening for "Jarvis".'; micBtn.classList.add('listening'); };
+  wakeRecog.onend = () => {
+    micBtn.classList.remove('listening');
+    if (wakeMode && !processingCommand) {
+      setTimeout(() => { try { wakeRecog.start(); } catch (e) { console.warn('wakeRecog restart failed', e); } }, 300);
+    } else {
+      if (!wakeMode) statusText.textContent = 'Wake-mode disabled.';
+    }
+  };
+  wakeRecog.onerror = (e) => {
+    console.warn('wakeRecog error', e);
+    if (wakeMode && !processingCommand) {
+      statusText.textContent = 'Wake-mode error; retrying…';
+      setTimeout(()=>{ try{ wakeRecog.start(); }catch(e){} }, 500);
+    }
+  };
+
+  wakeRecog.onresult = async (evt) => {
+    let interim=''; let final='';
+    for (let i=evt.resultIndex; i<evt.results.length; i++){
+      const r = evt.results[i];
+      if (r.isFinal) final += r[0].transcript + ' ';
+      else interim += r[0].transcript + ' ';
+    }
+    const textSoFar = (final + interim).trim().toLowerCase();
+    if (!textSoFar) return;
+    const now = Date.now();
+    if (now - lastWakeMs < 2000) return;
+    const match = textSoFar.match(/\bjarvis\b/);
+    if (match && !processingCommand) {
+      processingCommand = true;
+      lastWakeMs = now;
+      try { wakeRecog.stop(); } catch(e){ console.warn('wakeRecog stop error', e); }
+      const after = textSoFar.slice(match.index + match[0].length).trim();
+      if (after) {
+        await processCommandText(after);
+      } else {
+        speak('Yes, sir.');
+        const cmd = await captureSingleCommand();
+        if (cmd) await processCommandText(cmd);
+      }
+      processingCommand = false;
+      if (wakeMode) {
+        setTimeout(() => { try { wakeRecog.start(); } catch (e) { console.warn('wakeRecog restart after command failed', e); } }, 250);
+      }
+    }
+  };
+
+  // commandRecog dynamic single-shot
+  commandRecog = new Recog();
+  commandRecog.lang = 'en-US';
+  commandRecog.interimResults = false;
+  commandRecog.continuous = false;
+
+} else {
+  statusText.textContent = 'Speech recognition not supported in this browser.';
+  micBtn.style.opacity = 0.5;
+  micBtn.style.cursor = 'not-allowed';
+}
+
+// Click / dblclick behavior
+micBtn.addEventListener('click', (ev) => {
+  if (ev && ev.preventDefault) ev.preventDefault();
+  if (!recognition) { alert('Speech recognition not supported, sir.'); return; }
+  if (wakeMode) {
+    if (wakeRecog && !processingCommand) { try { wakeRecog.stop(); } catch(e){} }
+    wakeBadge.style.display = 'none';
+    try { recognition.start(); } catch(e){ console.warn('manual start failed', e); }
+    return;
+  }
+  try { recognition.start(); } catch (e) { console.warn('manual start failed', e); }
+});
+micBtn.addEventListener('dblclick', (ev) => {
+  if (ev && ev.preventDefault) ev.preventDefault();
+  if (!wakeRecog) { alert('Wake-word not supported in this browser, sir.'); return; }
+  wakeMode = !wakeMode;
+  if (wakeMode) {
+    try { wakeRecog.start(); wakeBadge.style.display = 'block'; statusText.textContent = 'Wake-mode enabled — listening for "Jarvis". Double-click again to disable.'; }
+    catch (e) { console.warn('wakeRecog start failed', e); statusText.textContent = 'Failed to start wake-mode. Try refreshing and double-clicking again.'; wakeMode = false; wakeBadge.style.display = 'none'; }
+  } else {
+    try { wakeRecog.stop(); } catch(e){} wakeBadge.style.display = 'none'; statusText.textContent = 'Wake-mode disabled.';
+  }
+});
+
+/* captureSingleCommand: single-shot with dynamic handlers */
+function captureSingleCommand(timeoutMs=8000) {
+  return new Promise((resolve) => {
+    if (!commandRecog) { resolve(null); return; }
+    let resolved = false;
+    const onResult = (evt) => {
+      let transcript = '';
+      for (let i=0; i<evt.results.length; i++) transcript += evt.results[i][0].transcript;
+      cleanup();
+      if (!resolved) { resolved = true; resolve(transcript); }
+    };
+    const onEnd = () => { cleanup(); if (!resolved) { resolved = true; resolve(null); } };
+    const onError = () => { cleanup(); if (!resolved) { resolved = true; resolve(null); } };
+    function cleanup() {
+      try {
+        commandRecog.removeEventListener('result', onResult);
+        commandRecog.removeEventListener('end', onEnd);
+        commandRecog.removeEventListener('error', onError);
+      } catch(e){}
+    }
+    commandRecog.addEventListener('result', onResult);
+    commandRecog.addEventListener('end', onEnd);
+    commandRecog.addEventListener('error', onError);
+    try { commandRecog.start(); } catch(e){ cleanup(); resolve(null); }
+    setTimeout(() => { if (!resolved) { try { commandRecog.stop(); } catch(e){}; cleanup(); resolved = true; resolve(null); } }, timeoutMs);
+  });
+}
+
+/* ------------------ Command processing (intercepts vision requests) ------------------ */
+async function processCommandText(text) {
+  if (!text) return;
+  const trimmed = text.trim();
+  statusText.textContent = `Heard: "${trimmed}" — processing, sir…`;
+
+  // If it's a vision request, handle locally (camera + model) BEFORE sending to backend
+  if (isVisionRequest(trimmed)) {
+    statusText.textContent = 'Activating camera for vision…';
+    const camOk = await startCamera();
+    if (!camOk) {
+      statusText.textContent = 'Camera unavailable, sir.';
+      return;
+    }
+    // Let camera warm slightly (already warmed in startCamera)
+    const preds = await recognizeObjects();
+    // Stop camera to free mic & privacy
+    stopCamera();
+    const desc = describePredictions(preds);
+    // Speak and also add to conversation history as assistant result
+    speak(desc);
+    messages.push({role:'assistant', content: desc});
+    statusText.textContent = 'Vision complete, sir.';
+    return;
+  }
+
+  // Not a vision request — send to backend as before
+  messages.push({role:'user', content: trimmed});
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ messages })
+    });
+    const data = await res.json();
+    if (data.error) { console.error('Chat error', data); statusText.textContent = 'JARVIS error, sir.'; speak('I am having trouble, sir.'); return; }
+    const reply = data.content || '';
+    const action = data.action || null;
+    messages.push({role:'assistant', content: reply});
+    if (reply) speak(reply);
+    if (action) handleActionObject(action);
+    statusText.textContent = 'JARVIS replied, sir.';
+  } catch (err) {
+    console.error('Network/Chat error', err);
+    statusText.textContent = 'Network error, sir.';
+    speak('I am offline or the server failed to respond, sir.');
+  }
+}
+
+/* ------------------ Action handling ------------------ */
+function handleActionObject(action) {
+  if (!action || typeof action !== 'object') return;
+  console.log('Action object received:', action);
+  if (action.action === 'open_url' && action.url) {
+    try {
+      const newWin = window.open(action.url, 'jarvis_target');
+      if (newWin) try { newWin.focus(); } catch(e){}
+      else {
+        fallbackBar.innerHTML = `Popup blocked. <a href="${escapeHtml(action.url)}" target="_blank" rel="noopener noreferrer">Open ${shortUrl(action.url)}</a>`;
+        fallbackBar.style.display = 'block';
+        setTimeout(()=> fallbackBar.style.display='none', 10000);
+      }
+    } catch (e) { console.warn('Navigation error:', e); }
+    return;
+  }
+  if (action.memory_update) return;
+  if (action.announce) speak(action.announce);
+}
+
+/* ------------------ Fallback GIF loader ------------------ */
+(function ensureGif() {
+  const img = new Image();
+  img.src = 'jarvis.gif';
+  img.onload = () => {};
+  img.onerror = () => {
+    document.body.style.backgroundImage = "url('https://media.giphy.com/media/3o7aD2saalBwwftBIY/giphy.gif'), linear-gradient(180deg,#000000,#00131a)";
+  };
+})();
+
+</script>
+</body>
+</html>
+
